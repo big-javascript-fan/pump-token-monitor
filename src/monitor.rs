@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -20,6 +21,8 @@ use crate::types::TokenRecord;
 
 const DEFAULT_RPC_URL_SENTINEL: &str = "https://mainnet.helius-rpc.com/?api-key=";
 const ENHANCED_POLL_LIMIT: usize = 1000;
+/// WSS can hang indefinitely if outbound 443 is blocked or the host never completes TLS.
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub type TokenState = Arc<Mutex<HashMap<String, TokenRecord>>>;
 
@@ -58,6 +61,27 @@ pub async fn run_stream_mode(
     }
 }
 
+fn redact_sensitive_ws_url(url: &str) -> String {
+    const NEEDLE: &str = "api-key=";
+    if let Some(i) = url.find(NEEDLE) {
+        let start_val = i + NEEDLE.len();
+        let val_end = url[start_val..]
+            .find('&')
+            .map(|p| start_val + p)
+            .unwrap_or(url.len());
+        format!("{}<redacted>{}", &url[..start_val], &url[val_end..])
+    } else {
+        url.to_string()
+    }
+}
+
+fn json_rpc_request_id(value: &Value) -> Option<i64> {
+    value.get("id").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+    })
+}
+
 async fn run_logs_subscribe(
     client: Client,
     runtime: Arc<AppRuntime>,
@@ -66,10 +90,53 @@ async fn run_logs_subscribe(
     telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     let ws_url = http_to_ws(&runtime.rpc_url)?;
-    eprintln!("[logsSubscribe] connecting to {}", ws_url);
-    let (ws_stream, _) = connect_async(&ws_url)
-        .await
-        .with_context(|| format!("failed connecting websocket: {}", ws_url))?;
+    let ws_url_log = redact_sensitive_ws_url(&ws_url);
+    eprintln!(
+        "[logsSubscribe] connecting WebSocket for pump program {}\n[logsSubscribe] ws endpoint: {}",
+        runtime.pump_program_id, ws_url_log
+    );
+
+    if runtime.rpc_url == DEFAULT_RPC_URL_SENTINEL {
+        eprintln!(
+            "[logsSubscribe] warning: rpc_url looks like an empty Helius placeholder — websocket may fail; set helius_api_key or a full rpc_url"
+        );
+    }
+
+    eprintln!(
+        "[logsSubscribe] dialing WebSocket (TCP → TLS → HTTP upgrade); timeout {:?}…",
+        WS_CONNECT_TIMEOUT
+    );
+    let connect_result =
+        tokio::time::timeout(WS_CONNECT_TIMEOUT, connect_async(ws_url.as_str())).await;
+
+    let (ws_stream, response) = match connect_result {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "WebSocket connect_async failed (TLS/DNS/upgrade rejected?). Endpoint: {}.\n\
+                 Common causes: wrong rpc_url for WSS, missing api-key on provider URL, \
+                 provider disallows websocket on this tier, or certificate/proxy issues.",
+                ws_url_log
+            )));
+        }
+        Err(_elapsed) => {
+            return Err(anyhow!(
+                "WebSocket connect timed out after {:?} — never finished TCP/TLS/WebSocket upgrade.\n\
+                 Endpoint: {}.\n\
+                 This usually means: outbound HTTPS (443) blocked by firewall/security group; \
+                 host unreachable from this server; DNS stuck; or RPC allows HTTP POST only (no WSS on same host).\n\
+                 Try from the server: `curl -sI \"{}\"` (replace ws→http if needed) and confirm provider docs for websocket URL.",
+                WS_CONNECT_TIMEOUT,
+                ws_url_log,
+                ws_url_log.replace("wss://", "https://").replace("ws://", "http://")
+            ));
+        }
+    };
+
+    eprintln!(
+        "[logsSubscribe] WebSocket handshake OK (HTTP status {})",
+        response.status()
+    );
     let (mut write, mut read) = ws_stream.split();
 
     let subscribe = serde_json::json!({
@@ -85,21 +152,97 @@ async fn run_logs_subscribe(
         .send(Message::Text(subscribe.to_string()))
         .await
         .context("failed sending logsSubscribe")?;
-    eprintln!("[logsSubscribe] subscription request sent");
+    eprintln!("[logsSubscribe] sent logsSubscribe JSON-RPC request (id=1), waiting for ack…");
+
+    let subscription_ack = Arc::new(AtomicBool::new(false));
+    let logs_notification_count = Arc::new(AtomicU64::new(0));
+
+    let ack_hb = Arc::clone(&subscription_ack);
+    let count_hb = Arc::clone(&logs_notification_count);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            let ack = ack_hb.load(Ordering::Relaxed);
+            let n = count_hb.load(Ordering::Relaxed);
+            eprintln!(
+                "[logsSubscribe] heartbeat (every 120s): subscription_acknowledged={} logs_notifications={}\
+                 \n    → if acknowledged=false: RPC did not confirm id=1 (wrong URL, plan, or WS unsupported);\
+                 \n    → if acknowledged=true but notifications=0: no matching logs yet or subscription filter mismatch.",
+                ack, n
+            );
+        }
+    });
 
     let create_discriminator = pump::anchor_discriminator("create");
     let create_v2_discriminator = pump::anchor_discriminator("create_v2");
 
+    let mut json_parse_warn_remaining: u8 = 8;
+    let mut non_text_logged: u8 = 0;
+
     while let Some(msg) = read.next().await {
         let msg = msg.context("websocket read failed")?;
         if !msg.is_text() {
+            if non_text_logged < 6 {
+                non_text_logged += 1;
+                eprintln!(
+                    "[logsSubscribe] non-text websocket frame (#{}): {:?} (often Ping/Pong — ok)",
+                    non_text_logged, msg
+                );
+            }
             continue;
         }
         let text = msg.to_text().context("failed to read websocket text")?;
         let value: Value = match serde_json::from_str(text) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                if json_parse_warn_remaining > 0 {
+                    json_parse_warn_remaining -= 1;
+                    let preview: String = text.chars().take(220).collect();
+                    eprintln!(
+                        "[logsSubscribe] skipped invalid JSON ({} remaining samples): {} — preview {:?}",
+                        json_parse_warn_remaining, e, preview
+                    );
+                }
+                continue;
+            }
         };
+
+        if json_rpc_request_id(&value) == Some(1) {
+            if let Some(err) = value.get("error") {
+                eprintln!(
+                    "[logsSubscribe] logsSubscribe FAILED (RPC error on id=1): {}\
+                     \n    Fix: use an RPC that supports Solana websocket logsSubscribe on this URL (many HTTP-only endpoints do not).",
+                    err
+                );
+                continue;
+            }
+            if value.get("result").is_some() {
+                subscription_ack.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "[logsSubscribe] subscription ACK OK from RPC: result={:?}",
+                    value.get("result")
+                );
+                continue;
+            }
+        }
+
+        if value
+            .get("method")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m == "logsNotification")
+        {
+            let n = logs_notification_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 {
+                eprintln!(
+                    "[logsSubscribe] first logsNotification received — logsSubscribe stream is LIVE"
+                );
+            } else if n > 0 && n % 1000 == 0 {
+                eprintln!(
+                    "[logsSubscribe] logsNotification running total={}",
+                    n
+                );
+            }
+        }
 
         let signature = value
             .get("params")
@@ -109,7 +252,6 @@ async fn run_logs_subscribe(
             .and_then(Value::as_str);
 
         let Some(signature) = signature else { continue };
-        // eprintln!("[logsSubscribe] received signature {}", pump::short_sig(signature));
 
         let tx = rpc::get_transaction(&client, &runtime.rpc_url, signature).await?;
         if let Some(extracted) = pump::extract_create_mint(
@@ -136,6 +278,9 @@ async fn run_logs_subscribe(
         }
     }
 
+    eprintln!(
+        "[logsSubscribe] websocket read stream ended (connection closed or dropped)"
+    );
     Ok(())
 }
 
