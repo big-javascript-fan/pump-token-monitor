@@ -179,6 +179,10 @@ async fn run_price_cron(
 
             for chunk in mints.chunks(batch_size) {
                 let prices = price::fetch_token_prices_usd(&client, &runtime, chunk).await?;
+                // Space out Jupiter Price vs Tokens calls and between cron batches to avoid 429.
+                if runtime.jupiter_api_key.as_deref().is_some() {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
                 let jup_map = crate::jupiter_tokens::search_tokens_by_mints(
                     &client,
                     runtime.jupiter_api_key.as_deref(),
@@ -187,11 +191,14 @@ async fn run_price_cron(
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!(
-                        "[price-cron] Jupiter tokens/v2/search failed for batch (check jupiter_api_key): {:#}",
+                        "[price-cron] Jupiter tokens/v2/search failed for batch after retries: {:#}",
                         e
                     );
                     Default::default()
                 });
+                if runtime.jupiter_api_key.as_deref().is_some() {
+                    tokio::time::sleep(Duration::from_millis(280)).await;
+                }
 
                 for (mint, p) in prices {
                     let row_before = db::get_token(&db, &mint).await?;

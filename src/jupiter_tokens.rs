@@ -1,10 +1,16 @@
 //! Jupiter Tokens API v2 — metadata (`usdPrice`, `mcap`, `icon`, `isVerified`, etc.).
 //! See <https://developers.jup.ag/docs/guides/how-to-get-token-information>
+//!
+//! Retries on **429** / **503** with exponential backoff and optional `Retry-After` header,
+//! so price-cron can run large backlogs without tripping Jupiter rate limits.
 
-use anyhow::{Context, Result};
-use reqwest::Client;
+use anyhow::{bail, Context, Result};
+use reqwest::header::RETRY_AFTER;
+use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::sleep;
 
 /// Same host as documented Tokens API (`GET /tokens/v2/search`).
 const DEFAULT_JUPITER_API_ORIGIN: &str = "https://api.jup.ag";
@@ -63,6 +69,85 @@ fn parse_token_entry(v: &Value) -> Option<(String, TokenJupiterMeta)> {
     Some((id, meta))
 }
 
+const JUPITER_SEARCH_MAX_ATTEMPTS: u32 = 8;
+const JUPITER_SEARCH_BASE_BACKOFF_MS: u64 = 400;
+const JUPITER_SEARCH_MAX_BACKOFF_MS: u64 = 25_000;
+
+fn backoff_after_rate_limit(attempt: u32) -> Duration {
+    let exp = (JUPITER_SEARCH_BASE_BACKOFF_MS).saturating_mul(1u64 << attempt.min(6));
+    Duration::from_millis(exp.min(JUPITER_SEARCH_MAX_BACKOFF_MS).max(JUPITER_SEARCH_BASE_BACKOFF_MS))
+}
+
+fn retry_after_from_response(resp: &reqwest::Response, attempt: u32) -> Duration {
+    if let Some(h) = resp.headers().get(RETRY_AFTER) {
+        if let Ok(s) = h.to_str() {
+            if let Ok(secs) = s.parse::<u64>() {
+                return Duration::from_secs(secs.clamp(1, 120));
+            }
+        }
+    }
+    backoff_after_rate_limit(attempt)
+}
+
+async fn fetch_search_json(
+    client: &Client,
+    base: &str,
+    query: &str,
+    api_key: &str,
+) -> Result<Value> {
+    let mut last_status: Option<StatusCode> = None;
+
+    for attempt in 0..JUPITER_SEARCH_MAX_ATTEMPTS {
+        let resp = client
+            .get(base)
+            .query(&[("query", query)])
+            .header("x-api-key", api_key.trim())
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "jupiter tokens/v2/search request failed (attempt {}/{})",
+                    attempt + 1,
+                    JUPITER_SEARCH_MAX_ATTEMPTS
+                )
+            })?;
+
+        let status = resp.status();
+        last_status = Some(status);
+
+        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+            let wait = retry_after_from_response(&resp, attempt);
+            drop(resp);
+            sleep(wait).await;
+            continue;
+        }
+
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("(body unavailable)"));
+            let snippet: String = body.chars().take(280).collect();
+            bail!(
+                "jupiter tokens/v2/search HTTP {}: {}",
+                status.as_u16(),
+                snippet
+            );
+        }
+
+        return resp
+            .json()
+            .await
+            .context("jupiter tokens/v2/search JSON parse failed");
+    }
+
+    bail!(
+        "jupiter tokens/v2/search: still rate-limited after {} attempts (last HTTP {:?})",
+        JUPITER_SEARCH_MAX_ATTEMPTS,
+        last_status
+    )
+}
+
 /// Batch lookup by mint addresses using `GET /tokens/v2/search?query=mint1,mint2,...` (max 100 per Jupiter docs).
 /// Requires [`crate::config::AppRuntime::jupiter_api_key`] (`x-api-key` header).
 pub async fn search_tokens_by_mints(
@@ -84,18 +169,7 @@ pub async fn search_tokens_by_mints(
         DEFAULT_JUPITER_API_ORIGIN.trim_end_matches('/')
     );
 
-    let v: Value = client
-        .get(base)
-        .query(&[("query", query.as_str())])
-        .header("x-api-key", api_key.trim())
-        .send()
-        .await
-        .context("jupiter tokens/v2/search request failed")?
-        .error_for_status()
-        .context("jupiter tokens/v2/search HTTP error")?
-        .json()
-        .await
-        .context("jupiter tokens/v2/search JSON")?;
+    let v: Value = fetch_search_json(client, &base, &query, api_key).await?;
 
     let Some(arr) = v.as_array() else {
         return Ok(out);
