@@ -59,10 +59,10 @@ pub async fn scan_and_mark_dead(db: &Db) -> Result<Vec<DeadTokenAlert>> {
             continue;
         };
         let alert = DeadTokenAlert {
-            mint: row.0.clone(),
-            name: row.1.clone(),
-            first_price_usd: row.4,
-            last_price_usd: row.6,
+            mint: row.mint.clone(),
+            name: row.name.clone(),
+            first_price_usd: row.first_price_usd,
+            last_price_usd: row.price_usd,
         };
         crate::db::mark_token_dead(db, &mint).await?;
         alerts.push(alert);

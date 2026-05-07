@@ -53,6 +53,15 @@ struct TokenResponse {
     price_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     dead_token: bool,
     dead_marked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Jupiter Tokens API v2 (`/tokens/v2/search`): symbol, icon, verification, mcap, etc.
+    /// See https://developers.jup.ag/docs/guides/how-to-get-token-information
+    token_symbol: Option<String>,
+    token_icon_url: Option<String>,
+    token_decimals: Option<i32>,
+    jupiter_is_verified: Option<bool>,
+    jupiter_mcap_usd: Option<f64>,
+    jupiter_organic_score: Option<f64>,
+    stats_24h_price_change_pct: Option<f64>,
 }
 
 fn price_change_pct(first_price_usd: Option<f64>, price_usd: Option<f64>) -> Option<f64> {
@@ -64,35 +73,27 @@ fn price_change_pct(first_price_usd: Option<f64>, price_usd: Option<f64>) -> Opt
     Some((p - f) / f * 100.0)
 }
 
-fn token_row_to_response(
-    (
-        mint,
-        name,
-        first_slot,
-        last_slot,
-        first_price_usd,
-        _first_price_at,
-        price_usd,
-        price_updated_at,
-        first_seen,
-        last_seen,
-        dead_token,
-        dead_marked_at,
-    ): db::DbTokenRow,
-) -> TokenResponse {
+fn token_row_to_response(row: db::DbTokenRow) -> TokenResponse {
     TokenResponse {
-        mint,
-        name,
-        first_slot,
-        last_slot,
-        first_seen: Some(first_seen),
-        last_seen: Some(last_seen),
-        first_price_usd,
-        price_usd,
-        price_change_pct: price_change_pct(first_price_usd, price_usd),
-        price_updated_at,
-        dead_token,
-        dead_marked_at,
+        mint: row.mint,
+        name: row.name,
+        first_slot: row.first_slot,
+        last_slot: row.last_slot,
+        first_seen: Some(row.first_seen),
+        last_seen: Some(row.last_seen),
+        first_price_usd: row.first_price_usd,
+        price_usd: row.price_usd,
+        price_change_pct: price_change_pct(row.first_price_usd, row.price_usd),
+        price_updated_at: row.price_updated_at,
+        dead_token: row.dead_token,
+        dead_marked_at: row.dead_marked_at,
+        token_symbol: row.token_symbol,
+        token_icon_url: row.token_icon_url,
+        token_decimals: row.token_decimals,
+        jupiter_is_verified: row.jupiter_is_verified,
+        jupiter_mcap_usd: row.jupiter_mcap_usd,
+        jupiter_organic_score: row.jupiter_organic_score,
+        stats_24h_price_change_pct: row.stats_24h_price_change_pct,
     }
 }
 
@@ -145,7 +146,15 @@ async fn register_token(
         db::clear_dead_flag(db, &mint).await.map_err(internal)?;
         match crate::price::fetch_token_price_usd(&st.http, &st.runtime, &mint).await {
             Ok(Some(px)) => {
-                let _ = db::update_token_price(db, &mint, px).await;
+                let map = crate::jupiter_tokens::search_tokens_by_mints(
+                    &st.http,
+                    st.runtime.jupiter_api_key.as_deref(),
+                    &[mint.clone()],
+                )
+                .await
+                .unwrap_or_default();
+                let jup = map.get(&mint);
+                let _ = db::update_token_price_from_cron(db, &mint, px, jup).await;
             }
             _ => {}
         }
@@ -182,6 +191,13 @@ async fn register_token(
         price_updated_at: None,
         dead_token: false,
         dead_marked_at: None,
+        token_symbol: None,
+        token_icon_url: None,
+        token_decimals: None,
+        jupiter_is_verified: None,
+        jupiter_mcap_usd: None,
+        jupiter_organic_score: None,
+        stats_24h_price_change_pct: None,
     }))
 }
 
@@ -221,7 +237,7 @@ async fn health(State(st): State<ApiState>) -> impl IntoResponse {
         "wallet": wallet,
         "pump_program_id": st.runtime.pump_program_id,
         "tokens_sort": serde_json::json!([
-            "first_seen", "last_seen", "change_desc", "change_asc"
+            "first_seen", "last_seen", "change_desc", "change_asc", "mcap_desc"
         ]),
     }))
 }
@@ -250,42 +266,11 @@ async fn list_tokens_batch(
     rows.sort_by_key(|row| {
         mints
             .iter()
-            .position(|m| m == &row.0)
+            .position(|m| m == &row.mint)
             .unwrap_or(usize::MAX)
     });
 
-    let out: Vec<TokenResponse> = rows
-        .into_iter()
-        .map(
-            |(
-                mint,
-                name,
-                first_slot,
-                last_slot,
-                first_price_usd,
-                _first_price_at,
-                price_usd,
-                price_updated_at,
-                first_seen,
-                last_seen,
-                dead_token,
-                dead_marked_at,
-            )| TokenResponse {
-                mint,
-                name,
-                first_slot,
-                last_slot,
-                first_seen: Some(first_seen),
-                last_seen: Some(last_seen),
-                first_price_usd,
-                price_usd,
-                price_change_pct: price_change_pct(first_price_usd, price_usd),
-                price_updated_at,
-                dead_token,
-                dead_marked_at,
-            },
-        )
-        .collect();
+    let out: Vec<TokenResponse> = rows.into_iter().map(token_row_to_response).collect();
     Ok(Json(out))
 }
 
@@ -300,38 +285,7 @@ async fn list_tokens(
         let rows = db::list_tokens(pool, limit, offset, sort, q.search.as_deref())
             .await
             .map_err(internal)?;
-        let out: Vec<TokenResponse> = rows
-            .into_iter()
-            .map(
-                |(
-                    mint,
-                    name,
-                    first_slot,
-                    last_slot,
-                    first_price_usd,
-                    _first_price_at,
-                    price_usd,
-                    price_updated_at,
-                    first_seen,
-                    last_seen,
-                    dead_token,
-                    dead_marked_at,
-                )| TokenResponse {
-                mint,
-                name,
-                first_slot,
-                last_slot,
-                first_seen: Some(first_seen),
-                last_seen: Some(last_seen),
-                first_price_usd,
-                price_usd,
-                price_change_pct: price_change_pct(first_price_usd, price_usd),
-                price_updated_at,
-                dead_token,
-                dead_marked_at,
-            },
-            )
-            .collect();
+        let out: Vec<TokenResponse> = rows.into_iter().map(token_row_to_response).collect();
         return Ok(Json(out));
     }
 
@@ -373,6 +327,13 @@ async fn list_tokens(
             price_updated_at: None,
             dead_token: false,
             dead_marked_at: None,
+            token_symbol: None,
+            token_icon_url: None,
+            token_decimals: None,
+            jupiter_is_verified: None,
+            jupiter_mcap_usd: None,
+            jupiter_organic_score: None,
+            stats_24h_price_change_pct: None,
         })
         .collect();
 
@@ -385,35 +346,8 @@ async fn get_token(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if let Some(db) = st.db.as_ref() {
         let row = db::get_token(db, &mint).await.map_err(internal)?;
-        if let Some((
-            mint,
-            name,
-            first_slot,
-            last_slot,
-            first_price_usd,
-            _first_price_at,
-            price_usd,
-            price_updated_at,
-            first_seen,
-            last_seen,
-            dead_token,
-            dead_marked_at,
-        )) = row
-        {
-            return Ok(Json(TokenResponse {
-                mint,
-                name,
-                first_slot,
-                last_slot,
-                first_seen: Some(first_seen),
-                last_seen: Some(last_seen),
-                first_price_usd,
-                price_usd,
-                price_change_pct: price_change_pct(first_price_usd, price_usd),
-                price_updated_at,
-                dead_token,
-                dead_marked_at,
-            }));
+        if let Some(row) = row {
+            return Ok(Json(token_row_to_response(row)));
         }
         return Err((StatusCode::NOT_FOUND, "not found".to_string()));
     }
@@ -435,6 +369,13 @@ async fn get_token(
         price_updated_at: None,
         dead_token: false,
         dead_marked_at: None,
+        token_symbol: None,
+        token_icon_url: None,
+        token_decimals: None,
+        jupiter_is_verified: None,
+        jupiter_mcap_usd: None,
+        jupiter_organic_score: None,
+        stats_24h_price_change_pct: None,
     }))
 }
 
@@ -632,7 +573,7 @@ async fn trade_buy(
     let token_name = db::get_token(&db, mint)
         .await
         .map_err(internal)?
-        .map(|r| r.1)
+        .map(|r| r.name)
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| mint.to_string());
 

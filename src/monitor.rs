@@ -16,7 +16,6 @@ use crate::db::Db;
 use crate::price;
 use crate::pump;
 use crate::rpc;
-use crate::telegram::{escape_html, solscan_account_url, TelegramNotifier};
 use crate::types::TokenRecord;
 
 const DEFAULT_RPC_URL_SENTINEL: &str = "https://mainnet.helius-rpc.com/?api-key=";
@@ -33,12 +32,11 @@ pub async fn run_stream_mode(
     db: Option<Db>,
     stream_mode: &str,
     rpc_backfill: RpcBackfillParams,
-    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     match stream_mode {
-        "logs" => run_logs_subscribe(client, runtime, state, db, telegram).await,
-        "backfill" => run_rpc_backfill(client, runtime, state, db, rpc_backfill, telegram).await,
-        "enhanced" => run_enhanced_backfill(client, runtime, state, db, telegram).await,
+        "logs" => run_logs_subscribe(client, runtime, state, db).await,
+        "backfill" => run_rpc_backfill(client, runtime, state, db, rpc_backfill).await,
+        "enhanced" => run_enhanced_backfill(client, runtime, state, db).await,
         "both" => {
             let c1 = client.clone();
             let c2 = client;
@@ -49,12 +47,10 @@ pub async fn run_stream_mode(
             let d1 = db.clone();
             let d2 = db;
             let p = rpc_backfill.clone();
-            let tg1 = telegram.clone();
-            let tg2 = telegram;
 
             tokio::select! {
-                res = run_logs_subscribe(c1, r1, s1, d1, tg1) => res,
-                res = run_rpc_backfill(c2, r2, s2, d2, p, tg2) => res,
+                res = run_logs_subscribe(c1, r1, s1, d1) => res,
+                res = run_rpc_backfill(c2, r2, s2, d2, p) => res,
             }
         }
         other => Err(anyhow!("unsupported stream_mode in config.toml: {}", other)),
@@ -87,7 +83,6 @@ async fn run_logs_subscribe(
     runtime: Arc<AppRuntime>,
     state: TokenState,
     dbi: Option<Db>,
-    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     let ws_url = http_to_ws(&runtime.rpc_url)?;
     let ws_url_log = redact_sensitive_ws_url(&ws_url);
@@ -164,12 +159,23 @@ async fn run_logs_subscribe(
             tokio::time::sleep(Duration::from_secs(120)).await;
             let ack = ack_hb.load(Ordering::Relaxed);
             let n = count_hb.load(Ordering::Relaxed);
-            eprintln!(
-                "[logsSubscribe] heartbeat (every 120s): subscription_acknowledged={} logs_notifications={}\
-                 \n    → if acknowledged=false: RPC did not confirm id=1 (wrong URL, plan, or WS unsupported);\
-                 \n    → if acknowledged=true but notifications=0: no matching logs yet or subscription filter mismatch.",
-                ack, n
-            );
+            if ack && n > 0 {
+                eprintln!(
+                    "[logsSubscribe] heartbeat (every 120s): OK — subscription active, logs_notifications total={}",
+                    n
+                );
+            } else if !ack {
+                eprintln!(
+                    "[logsSubscribe] heartbeat (every 120s): subscription_acknowledged=false notifications_seen={}\n\
+                     → RPC never acknowledged logsSubscribe (id=1): wrong WS URL, plan without websocket, or unsupported.",
+                    n
+                );
+            } else {
+                eprintln!(
+                    "[logsSubscribe] heartbeat (every 120s): subscribed OK but logs_notifications=0\n\
+                     → No logs notifications yet — wrong pump_program_id filter, or RPC lag / idle slice."
+                );
+            }
         }
     });
 
@@ -266,8 +272,6 @@ async fn run_logs_subscribe(
                 &client,
                 &runtime,
                 dbi.as_ref(),
-                telegram.as_ref(),
-                true,
                 TokenRecord {
                     slot,
                     name: extracted.name,
@@ -290,7 +294,6 @@ async fn run_rpc_backfill(
     state: TokenState,
     dbi: Option<Db>,
     params: RpcBackfillParams,
-    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     if runtime.rpc_url == DEFAULT_RPC_URL_SENTINEL {
         return Err(anyhow!(
@@ -372,8 +375,6 @@ async fn run_rpc_backfill(
                     &client,
                     &runtime,
                     dbi.as_ref(),
-                    telegram.as_ref(),
-                    false,
                     TokenRecord {
                         slot,
                         name: extracted.name,
@@ -404,7 +405,6 @@ async fn run_enhanced_backfill(
     runtime: Arc<AppRuntime>,
     state: TokenState,
     dbi: Option<Db>,
-    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     let Some(api_key) = runtime.helius_api_key.clone() else {
         return Err(anyhow!(
@@ -458,8 +458,6 @@ async fn run_enhanced_backfill(
                     &client,
                     &runtime,
                     dbi.as_ref(),
-                    telegram.as_ref(),
-                    false,
                     TokenRecord {
                         slot,
                         name: extracted.name,
@@ -487,8 +485,6 @@ async fn upsert_token(
     client: &Client,
     runtime: &AppRuntime,
     dbi: Option<&Db>,
-    telegram: Option<&TelegramNotifier>,
-    telegram_new_mint_alert: bool,
     record: TokenRecord,
 ) -> Result<()> {
     let mut guard = state.lock().await;
@@ -509,24 +505,6 @@ async fn upsert_token(
         if let Some(price) = price::fetch_token_price_usd(client, runtime, &inserted.mint).await? {
             db::update_token_price(db, &inserted.mint, price).await?;
             eprintln!("[price] mint={} usd={}", inserted.mint, price);
-        }
-    }
-
-    if let Some(bot) = telegram {
-        if telegram_new_mint_alert {
-            let url = solscan_account_url(&inserted.mint);
-            let name_esc = escape_html(&inserted.name);
-            let mint_esc = escape_html(&inserted.mint);
-            let html = format!(
-                "<b>New Pump mint</b>\n\
-                 Name: {}\n\
-                 Mint: <a href=\"{}\">{}</a>\n\
-                 Slot: {}",
-                name_esc, url, mint_esc, inserted.slot
-            );
-            if let Err(e) = bot.send_html(&html).await {
-                eprintln!("[token] telegram new-mint notify failed: {:#}", e);
-            }
         }
     }
 

@@ -3,27 +3,45 @@ use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 
+use crate::jupiter_tokens::TokenJupiterMeta;
 use crate::types::TokenRecord;
+
+/// Column order must match [`DbTokenRow`] for `query_as`.
+const TOKEN_ROW_SQL: &str = r#"mint, name, first_slot, last_slot, first_price_usd, first_price_at,
+               price_usd, price_updated_at, first_seen, last_seen, dead_token, dead_marked_at,
+               token_symbol, token_icon_url, token_decimals, jupiter_is_verified, jupiter_mcap_usd,
+               jupiter_organic_score, stats_24h_price_change_pct"#;
 
 #[derive(Clone)]
 pub struct Db {
     pub pool: PgPool,
 }
 
-pub type DbTokenRow = (
-    String,
-    String,
-    i64,
-    i64,
-    Option<f64>,
-    Option<DateTime<Utc>>,
-    Option<f64>,
-    Option<DateTime<Utc>>,
-    DateTime<Utc>,
-    DateTime<Utc>,
-    bool,
-    Option<DateTime<Utc>>,
-);
+/// Postgres row for `pump_tokens` (matches column names for `sqlx::FromRow`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PumpTokenRow {
+    pub mint: String,
+    pub name: String,
+    pub first_slot: i64,
+    pub last_slot: i64,
+    pub first_price_usd: Option<f64>,
+    pub first_price_at: Option<DateTime<Utc>>,
+    pub price_usd: Option<f64>,
+    pub price_updated_at: Option<DateTime<Utc>>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub dead_token: bool,
+    pub dead_marked_at: Option<DateTime<Utc>>,
+    pub token_symbol: Option<String>,
+    pub token_icon_url: Option<String>,
+    pub token_decimals: Option<i32>,
+    pub jupiter_is_verified: Option<bool>,
+    pub jupiter_mcap_usd: Option<f64>,
+    pub jupiter_organic_score: Option<f64>,
+    pub stats_24h_price_change_pct: Option<f64>,
+}
+
+pub type DbTokenRow = PumpTokenRow;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TokenListSort {
@@ -36,6 +54,8 @@ pub enum TokenListSort {
     ChangePctDesc,
     /// Largest negative % change first.
     ChangePctAsc,
+    /// Highest Jupiter-reported market cap first (`mcap` from Tokens API).
+    McapDesc,
 }
 
 impl TokenListSort {
@@ -47,6 +67,7 @@ impl TokenListSort {
             Some("last_seen") | Some("recent") | Some("active") => Self::LastSeenDesc,
             Some("change_desc") | Some("pct_desc") | Some("gainers") | Some("+") => Self::ChangePctDesc,
             Some("change_asc") | Some("pct_asc") | Some("losers") | Some("-") => Self::ChangePctAsc,
+            Some("mcap_desc") | Some("mcap") | Some("trending") | Some("top_mcap") => Self::McapDesc,
             _ => Self::FirstSeenDesc,
         }
     }
@@ -66,6 +87,9 @@ impl TokenListSort {
                  when first_price_usd is not null and price_usd is not null and first_price_usd <> 0::float8 \
                  then (price_usd - first_price_usd) / first_price_usd * 100::float8 end) \
                  asc nulls last, first_seen desc nulls last, mint asc"
+            }
+            TokenListSort::McapDesc => {
+                "order by jupiter_mcap_usd desc nulls last, last_seen desc nulls last, mint asc"
             }
         }
     }
@@ -121,6 +145,37 @@ pub async fn init_db(database_url: Option<&str>) -> Result<Option<Db>> {
         .execute(&pool)
         .await
         .context("failed to add dead_marked_at column")?;
+
+    sqlx::query(r#"alter table pump_tokens add column if not exists token_symbol text null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add token_symbol")?;
+    sqlx::query(r#"alter table pump_tokens add column if not exists token_icon_url text null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add token_icon_url")?;
+    sqlx::query(r#"alter table pump_tokens add column if not exists token_decimals integer null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add token_decimals")?;
+    sqlx::query(r#"alter table pump_tokens add column if not exists jupiter_is_verified boolean null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add jupiter_is_verified")?;
+    sqlx::query(r#"alter table pump_tokens add column if not exists jupiter_mcap_usd double precision null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add jupiter_mcap_usd")?;
+    sqlx::query(r#"alter table pump_tokens add column if not exists jupiter_organic_score double precision null"#)
+        .execute(&pool)
+        .await
+        .context("failed to add jupiter_organic_score")?;
+    sqlx::query(
+        r#"alter table pump_tokens add column if not exists stats_24h_price_change_pct double precision null"#,
+    )
+    .execute(&pool)
+    .await
+    .context("failed to add stats_24h_price_change_pct")?;
 
     sqlx::query(
         r#"
@@ -240,15 +295,93 @@ pub async fn update_token_price(db: &Db, mint: &str, price_usd: f64) -> Result<(
     Ok(())
 }
 
-pub async fn get_token(db: &Db, mint: &str) -> Result<Option<DbTokenRow>> {
-    let row = sqlx::query_as::<_, DbTokenRow>(
+/// Price cron: merge Jupiter [Tokens API](https://developers.jup.ag/docs/guides/how-to-get-token-information) fields when present.
+pub async fn update_token_price_from_cron(
+    db: &Db,
+    mint: &str,
+    price_usd: f64,
+    jupiter: Option<&TokenJupiterMeta>,
+) -> Result<()> {
+    let (
+        sym,
+        icon,
+        dec,
+        ver,
+        mcap,
+        org,
+        chg,
+        jname,
+    ) = match jupiter {
+        None => (
+            None::<String>,
+            None::<String>,
+            None::<i32>,
+            None::<bool>,
+            None::<f64>,
+            None::<f64>,
+            None::<f64>,
+            None::<String>,
+        ),
+        Some(j) => (
+            j.symbol.clone(),
+            j.icon.clone(),
+            j.decimals,
+            j.is_verified,
+            j.mcap_usd,
+            j.organic_score,
+            j.stats_24h_price_change_pct,
+            j.name.clone(),
+        ),
+    };
+
+    sqlx::query(
         r#"
-        select mint, name, first_slot, last_slot, first_price_usd, first_price_at,
-               price_usd, price_updated_at, first_seen, last_seen, dead_token, dead_marked_at
+        update pump_tokens
+        set first_price_usd = coalesce(first_price_usd, $2),
+            first_price_at = case when first_price_usd is null then now() else first_price_at end,
+            price_usd = $2,
+            price_updated_at = now(),
+            last_seen = now(),
+            token_symbol = coalesce($3, token_symbol),
+            token_icon_url = coalesce($4, token_icon_url),
+            token_decimals = coalesce($5, token_decimals),
+            jupiter_is_verified = coalesce($6, jupiter_is_verified),
+            jupiter_mcap_usd = coalesce($7, jupiter_mcap_usd),
+            jupiter_organic_score = coalesce($8, jupiter_organic_score),
+            stats_24h_price_change_pct = coalesce($9, stats_24h_price_change_pct),
+            name = case
+                when $10::text is not null and length(trim($10::text)) > 0 then trim($10::text)
+                else name
+                end
+        where mint = $1
+          and coalesce(dead_token, false) = false;
+        "#,
+    )
+    .bind(mint)
+    .bind(price_usd)
+    .bind(sym)
+    .bind(icon)
+    .bind(dec)
+    .bind(ver)
+    .bind(mcap)
+    .bind(org)
+    .bind(chg)
+    .bind(jname)
+    .execute(&db.pool)
+    .await
+    .context("failed to update token price + Jupiter metadata in Postgres")?;
+    Ok(())
+}
+
+pub async fn get_token(db: &Db, mint: &str) -> Result<Option<DbTokenRow>> {
+    let row = sqlx::query_as::<_, DbTokenRow>(&format!(
+        r#"
+        select {}
         from pump_tokens
         where mint = $1;
         "#,
-    )
+        TOKEN_ROW_SQL
+    ))
     .bind(mint)
     .fetch_optional(&db.pool)
     .await
@@ -264,14 +397,14 @@ pub async fn list_tokens_by_mints(db: &Db, mints: &[String]) -> Result<Vec<DbTok
     let cap = mints.len().min(MAX);
     let slice = &mints[..cap];
 
-    let rows = sqlx::query_as::<_, DbTokenRow>(
+    let rows = sqlx::query_as::<_, DbTokenRow>(&format!(
         r#"
-        select mint, name, first_slot, last_slot, first_price_usd, first_price_at,
-               price_usd, price_updated_at, first_seen, last_seen, dead_token, dead_marked_at
+        select {}
         from pump_tokens
         where mint = any($1);
         "#,
-    )
+        TOKEN_ROW_SQL
+    ))
     .bind(slice)
     .fetch_all(&db.pool)
     .await
@@ -294,8 +427,7 @@ pub async fn list_tokens(
     let sql = if needle.is_some() {
         format!(
             r#"
-            select mint, name, first_slot, last_slot, first_price_usd, first_price_at,
-                   price_usd, price_updated_at, first_seen, last_seen, dead_token, dead_marked_at
+            select {}
             from pump_tokens
             where coalesce(dead_token, false) = false
               and (
@@ -305,18 +437,19 @@ pub async fn list_tokens(
             {}
             limit $1 offset $2;
             "#,
+            TOKEN_ROW_SQL,
             sort.order_sql()
         )
     } else {
         format!(
             r#"
-            select mint, name, first_slot, last_slot, first_price_usd, first_price_at,
-                   price_usd, price_updated_at, first_seen, last_seen, dead_token, dead_marked_at
+            select {}
             from pump_tokens
             where coalesce(dead_token, false) = false
             {}
             limit $1 offset $2;
             "#,
+            TOKEN_ROW_SQL,
             sort.order_sql()
         )
     };

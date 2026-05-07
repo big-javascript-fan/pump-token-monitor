@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod db;
 mod dead_tokens;
+mod jupiter_tokens;
 mod monitor;
 mod price;
 mod pump;
@@ -110,9 +111,8 @@ async fn main() -> Result<()> {
 
     let monitor_task = tokio::spawn({
         let stream_mode = stream_mode.clone();
-        let tg_monitor = telegram_notify.clone();
         async move {
-            monitor::run_stream_mode(client, runtime, state, db, &stream_mode, rpc_backfill, tg_monitor).await
+            monitor::run_stream_mode(client, runtime, state, db, &stream_mode, rpc_backfill).await
         }
     });
 
@@ -179,10 +179,25 @@ async fn run_price_cron(
 
             for chunk in mints.chunks(batch_size) {
                 let prices = price::fetch_token_prices_usd(&client, &runtime, chunk).await?;
+                let jup_map = crate::jupiter_tokens::search_tokens_by_mints(
+                    &client,
+                    runtime.jupiter_api_key.as_deref(),
+                    chunk,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                        "[price-cron] Jupiter tokens/v2/search failed for batch (check jupiter_api_key): {:#}",
+                        e
+                    );
+                    Default::default()
+                });
+
                 for (mint, p) in prices {
                     let row_before = db::get_token(&db, &mint).await?;
 
-                    db::update_token_price(&db, &mint, p).await?;
+                    let jup = jup_map.get(&mint);
+                    db::update_token_price_from_cron(&db, &mint, p, jup).await?;
                     db::insert_price_point(&db, &mint, ts, p).await?;
                     updated += 1;
 
@@ -192,7 +207,7 @@ async fn run_price_cron(
 
                     let Some(old_last) = row_before
                         .as_ref()
-                        .and_then(|r| r.6)
+                        .and_then(|r| r.price_usd)
                         .filter(|x| x.is_finite() && *x > 0.0)
                     else {
                         continue;
@@ -215,10 +230,10 @@ async fn run_price_cron(
 
                     let name = row_before
                         .as_ref()
-                        .map(|r| r.1.as_str())
+                        .map(|r| r.name.as_str())
                         .filter(|s| !s.trim().is_empty())
                         .unwrap_or(&mint);
-                    let first_px = row_before.as_ref().and_then(|r| r.4);
+                    let first_px = row_before.as_ref().and_then(|r| r.first_price_usd);
 
                     let msg = format!(
                         "Price move ≥{}% (vs prior cron quote)\n\
