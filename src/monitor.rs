@@ -9,13 +9,13 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::config::{AppRuntime, RpcBackfillParams, OUTPUT_PATH};
+use crate::config::{AppRuntime, RpcBackfillParams};
 use crate::db;
 use crate::db::Db;
 use crate::price;
 use crate::pump;
 use crate::rpc;
-use crate::store;
+use crate::telegram::{escape_html, solscan_account_url, TelegramNotifier};
 use crate::types::TokenRecord;
 
 const DEFAULT_RPC_URL_SENTINEL: &str = "https://mainnet.helius-rpc.com/?api-key=";
@@ -30,11 +30,12 @@ pub async fn run_stream_mode(
     db: Option<Db>,
     stream_mode: &str,
     rpc_backfill: RpcBackfillParams,
+    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     match stream_mode {
-        "logs" => run_logs_subscribe(client, runtime, state, db).await,
-        "backfill" => run_rpc_backfill(client, runtime, state, db, rpc_backfill).await,
-        "enhanced" => run_enhanced_backfill(client, runtime, state, db).await,
+        "logs" => run_logs_subscribe(client, runtime, state, db, telegram).await,
+        "backfill" => run_rpc_backfill(client, runtime, state, db, rpc_backfill, telegram).await,
+        "enhanced" => run_enhanced_backfill(client, runtime, state, db, telegram).await,
         "both" => {
             let c1 = client.clone();
             let c2 = client;
@@ -45,10 +46,12 @@ pub async fn run_stream_mode(
             let d1 = db.clone();
             let d2 = db;
             let p = rpc_backfill.clone();
+            let tg1 = telegram.clone();
+            let tg2 = telegram;
 
             tokio::select! {
-                res = run_logs_subscribe(c1, r1, s1, d1) => res,
-                res = run_rpc_backfill(c2, r2, s2, d2, p) => res,
+                res = run_logs_subscribe(c1, r1, s1, d1, tg1) => res,
+                res = run_rpc_backfill(c2, r2, s2, d2, p, tg2) => res,
             }
         }
         other => Err(anyhow!("unsupported stream_mode in config.toml: {}", other)),
@@ -60,6 +63,7 @@ async fn run_logs_subscribe(
     runtime: Arc<AppRuntime>,
     state: TokenState,
     dbi: Option<Db>,
+    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     let ws_url = http_to_ws(&runtime.rpc_url)?;
     eprintln!("[logsSubscribe] connecting to {}", ws_url);
@@ -105,7 +109,7 @@ async fn run_logs_subscribe(
             .and_then(Value::as_str);
 
         let Some(signature) = signature else { continue };
-        eprintln!("[logsSubscribe] received signature {}", pump::short_sig(signature));
+        // eprintln!("[logsSubscribe] received signature {}", pump::short_sig(signature));
 
         let tx = rpc::get_transaction(&client, &runtime.rpc_url, signature).await?;
         if let Some(extracted) = pump::extract_create_mint(
@@ -120,6 +124,8 @@ async fn run_logs_subscribe(
                 &client,
                 &runtime,
                 dbi.as_ref(),
+                telegram.as_ref(),
+                true,
                 TokenRecord {
                     slot,
                     name: extracted.name,
@@ -139,6 +145,7 @@ async fn run_rpc_backfill(
     state: TokenState,
     dbi: Option<Db>,
     params: RpcBackfillParams,
+    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     if runtime.rpc_url == DEFAULT_RPC_URL_SENTINEL {
         return Err(anyhow!(
@@ -220,6 +227,8 @@ async fn run_rpc_backfill(
                     &client,
                     &runtime,
                     dbi.as_ref(),
+                    telegram.as_ref(),
+                    false,
                     TokenRecord {
                         slot,
                         name: extracted.name,
@@ -250,6 +259,7 @@ async fn run_enhanced_backfill(
     runtime: Arc<AppRuntime>,
     state: TokenState,
     dbi: Option<Db>,
+    telegram: Option<TelegramNotifier>,
 ) -> Result<()> {
     let Some(api_key) = runtime.helius_api_key.clone() else {
         return Err(anyhow!(
@@ -303,6 +313,8 @@ async fn run_enhanced_backfill(
                     &client,
                     &runtime,
                     dbi.as_ref(),
+                    telegram.as_ref(),
+                    false,
                     TokenRecord {
                         slot,
                         name: extracted.name,
@@ -330,6 +342,8 @@ async fn upsert_token(
     client: &Client,
     runtime: &AppRuntime,
     dbi: Option<&Db>,
+    telegram: Option<&TelegramNotifier>,
+    telegram_new_mint_alert: bool,
     record: TokenRecord,
 ) -> Result<()> {
     let mut guard = state.lock().await;
@@ -342,8 +356,6 @@ async fn upsert_token(
     );
     let mint = record.mint.clone();
     guard.insert(mint.clone(), record);
-    store::persist_tokens(OUTPUT_PATH, &guard)?;
-    eprintln!("[persist] updated {}", OUTPUT_PATH);
     let inserted = guard.get(&mint).cloned().expect("just inserted token record");
     drop(guard);
 
@@ -352,6 +364,24 @@ async fn upsert_token(
         if let Some(price) = price::fetch_token_price_usd(client, runtime, &inserted.mint).await? {
             db::update_token_price(db, &inserted.mint, price).await?;
             eprintln!("[price] mint={} usd={}", inserted.mint, price);
+        }
+    }
+
+    if let Some(bot) = telegram {
+        if telegram_new_mint_alert {
+            let url = solscan_account_url(&inserted.mint);
+            let name_esc = escape_html(&inserted.name);
+            let mint_esc = escape_html(&inserted.mint);
+            let html = format!(
+                "<b>New Pump mint</b>\n\
+                 Name: {}\n\
+                 Mint: <a href=\"{}\">{}</a>\n\
+                 Slot: {}",
+                name_esc, url, mint_esc, inserted.slot
+            );
+            if let Err(e) = bot.send_html(&html).await {
+                eprintln!("[token] telegram new-mint notify failed: {:#}", e);
+            }
         }
     }
 

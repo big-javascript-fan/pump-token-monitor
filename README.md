@@ -6,7 +6,7 @@ Rust script to track Pump.fun token mints via:
 - **`enhanced`**: Helius Enhanced REST API (`/v0/addresses/.../transactions`) for historical paging (optional).
 - **`logs`**: WebSocket `logsSubscribe` (program mentions).
 
-Writes incremental updates to `token.json`.
+New mints are stored in Postgres (when configured) and exposed via the HTTP API; an optional `import_token_json` binary can seed from a JSON file.
 
 ## Run
 

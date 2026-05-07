@@ -6,13 +6,22 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 axum = "0.7"
+base64 = "0.22"
+bincode = "1.3"
 bs58 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1.36", features = ["serde-float"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+solana-hash = { version = "2.2", default-features = false }
+solana-keypair = "2.2"
+solana-message = { version = "2.2", default-features = false }
+solana-signature = { version = "2.2", default-features = false }
+solana-signer = "2.2"
+solana-transaction = { version = "2.2", default-features = false, features = ["bincode"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }

@@ -94,7 +94,7 @@ async fn post_rpc<T: for<'de> Deserialize<'de>>(
         .unwrap_or("<unknown>");
 
     for attempt in 1..=MAX_RPC_RETRIES {
-        eprintln!("[rpc:http] {} attempt {}/{}", method_name, attempt, MAX_RPC_RETRIES);
+        // eprintln!("[rpc:http] {} attempt {}/{}", method_name, attempt, MAX_RPC_RETRIES);
         let response = client
             .post(rpc_url)
             .json(&payload)
