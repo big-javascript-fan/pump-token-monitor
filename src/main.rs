@@ -259,14 +259,14 @@ async fn run_price_cron(
                         pct,
                     );
 
-                    match tg.send_plain(&msg).await {
-                        Ok(()) => {
-                            alert_cooldown.insert(mint.clone(), now);
-                        }
-                        Err(e) => {
-                            eprintln!("[price-cron] telegram send failed for {}: {:#}", mint, e);
-                        }
-                    }
+                    // match tg.send_plain(&msg).await {
+                    //     Ok(()) => {
+                    //         alert_cooldown.insert(mint.clone(), now);
+                    //     }
+                    //     Err(e) => {
+                    //         eprintln!("[price-cron] telegram send failed for {}: {:#}", mint, e);
+                    //     }
+                    // }
                 }
             }
         }
